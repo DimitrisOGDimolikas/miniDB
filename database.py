@@ -6,6 +6,8 @@ import os
 from btree import Btree
 import shutil
 from misc import split_condition
+from users import User
+from groups import Group
 
 class Database:
     '''
@@ -13,6 +15,19 @@ class Database:
     '''
 
     def __init__(self, name, load=True):
+        self.users = {}
+        self.groups = {}
+        self.loggedInAs = None
+        all_privs = {'Create_User' : True, 'Delete_Tbl' : True}
+        #admin
+        admin = User('admin', 'admin', all_privs, set(), set())
+        self.users.update({'admin': admin})
+        self.loggedInAs = admin
+        #groups
+        admin_group = Group('admins', {'Create_User' : True, 'Delete_Tbl' : True}, set(), set())
+        self.groups.update({'admins': admin_group})
+        viewer_group = Group('admins', {}, set(), set())
+        self.groups.update({'viewers': viewer_group})
         self.tables = {}
         self._name = name
 
@@ -43,8 +58,104 @@ class Database:
         self.create_table('meta_indexes',  ['table_name', 'index_name'], [str, str])
         self.save()
 
+    def login(self, username, password):
+        if self.loggedInAs == None:
+            usr = self.users.get(username)
+            if usr != None:
+                if usr.password == password:
+                    self.loggedInAs = usr
+                    print("Welcome ", username)
+                else:
+                    print('Username and password do not match')
+            else:
+                print('This user not found')
+        else:
+            print("Already Logged in.")
 
+    def logout(self):
+        self.loggedInAs = None
+        print("Logged Out Successfully")
 
+    def create_group(self, name, privs, del_privs, sel_privs):
+        if self.loggedInAs.can_create():
+            del_privileges = dict()
+            sel_privileges = dict()
+
+            for priv in del_privs:
+                del_privileges.update({priv: True})
+
+            for priv in sel_privs:
+                sel_privileges.update({priv: True})
+            self.groups.update({name: Group(name, privs, del_privileges, sel_privileges)})
+            print("{g} Group has been created".format(g=name))
+        else:
+            print("You don't have the privileges to create a new Group")
+
+    def add_user_to_group(self, group_name, user_name):
+        if self.loggedInAs.can_create():
+            group = self.groups.get(group_name)
+            user = self.users.get(user_name)
+            if group != None and user != None:
+                group.add_user(user)
+
+     def create_user(self,username, password):
+        priv = {'Create_User' : False, 'Delete_Tbl' : False}
+        if self.loggedInAs.can_create():
+            self.users.update({username: User(username, password, priv, set(), set())})
+            print("User: {U} has been created".format(U=username))
+        else:
+            print("You don't have the privileges to Create a new User")
+
+    def grant_all_privileges(self, username):
+        if self.loggedInAs.can_create():
+            user = self.users.get(username)
+            if user != None:
+                priv_up = {'Create_User' : True, 'Delete_Tbl' : True}
+                user.privileges.update(priv_up)
+
+    def grant_create_privilege(self, usr):
+        if self.loggedInAs.can_create():
+            user = self.users.get(usr)
+            if user != None:
+                priv_up = {'Create_User' : True}
+                user.privileges.update(priv_up)
+        else:
+            print("You dont have privileges to add privileges")
+
+    def grant_delete_privilege(self, usr):
+        if self.loggedInAs.can_create():
+            user = self.users.get(usr)
+            if user != None:
+                priv_up = {'Delete_Tbl' : True}
+                user.privileges.update(priv_up)
+                user.tbls_del.add('meta_locks')
+                user.tbls_del.add('meta_length')
+                user.tbls_del.add('meta_insert_stack')
+                print("Granted ", usr, " delete priv and required priv")
+        else:
+            print("You dont have privileges to add privileges")
+
+    def grant_select_table_privileges(self, usr, table):
+        if self.loggedInAs.can_create():
+            user = self.users.get(usr)
+            if user != None:
+                user.tbls_sel.add(table)
+                print("Granted ", usr, " required privileges to select table")
+                if 'meta_locks' not in user.tbls_sel:
+                    user.tbls_sel.add('meta_locks')
+        else:
+            print("You dont have privileges to add privileges")
+
+    def grant_delete_table_privileges(self, usr, table):
+        if self.loggedInAs.can_create():
+            user = self.users.get(usr)
+            if user != None:
+                user.tbls_del.add(table)
+                user.tbls_sel.add('meta_locks')
+                print("Granted ", usr, " required privileges to delete table rows")
+        else:
+            print("You dont have privileges to add privileges")
+                       
     def save(self):
         '''
         Save db as a pkl file. This method saves the db object, ie all the tables and attributes.
@@ -96,6 +207,13 @@ class Database:
         or
         db_object.table_name
         '''
+        # adding privileges for new table to admin
+        self.users.get('admin').tbls_sel.add(name)
+        self.users.get('admin').tbls_del.add(name)
+        # adding privileges to groups
+        self.groups.get('admins').update_delete_privs(name)
+        self.groups.get('admins').update_select_privs(name)
+        self.groups.get('viewers').update_select_privs(name)
         self.tables.update({name: Table(name=name, column_names=column_names, column_types=column_types, primary_key=primary_key, load=load)})
         # self._name = Table(name=name, column_names=column_names, column_types=column_types, load=load)
         # check that new dynamic var doesnt exist already
@@ -113,9 +231,10 @@ class Database:
         '''
         Drop table with name 'table_name' from current db
         '''
-        self.load(self.savedir)
-        if self.is_locked(table_name):
-            return
+        if self.loggedInAs.can_delete():
+            self.load(self.savedir)
+            if self.is_locked(table_name):
+                return
 
         self.tables.pop(table_name)
         delattr(self, table_name)
@@ -127,8 +246,20 @@ class Database:
         self.delete('meta_length', f'table_name=={table_name}')
         self.delete('meta_insert_stack', f'table_name=={table_name}')
 
+        self.tables.pop(table_name)
+        delattr(self, table_name)
+        if os.path.isfile(f'{self.savedir}/{table_name}.pkl'):
+            os.remove(f'{self.savedir}/{table_name}.pkl')
+        else:
+            print(f'"{self.savedir}/{table_name}.pkl" does not exist.')
+        self.delete('meta_locks', f'table_name=={table_name}')
+        self.delete('meta_length', f'table_name=={table_name}')
+        self.delete('meta_insert_stack', f'table_name=={table_name}')
         # self._update()
-        self.save()
+            self.save()
+        else:
+            print('You don\'t have the required privileges to delete the table..')
+
 
 
     def table_from_csv(self, filename, name=None, column_types=None, primary_key=None):
@@ -276,18 +407,21 @@ class Database:
 
                     operatores supported -> (<,<=,==,>=,>)
         '''
-        self.load(self.savedir)
-        if self.is_locked(table_name):
-            return
-        self.lockX_table(table_name)
-        deleted = self.tables[table_name]._delete_where(condition)
-        self.unlock_table(table_name)
-        self._update()
-        self.save()
-        # we need the save above to avoid loading the old database that still contains the deleted elements
-        if table_name[:4]!='meta':
-            self._add_to_insert_stack(table_name, deleted)
-        self.save()
+        if self.loggedInAs.can_del_tbl(table_name):
+            self.load(self.savedir)
+            if self.is_locked(table_name):
+                return
+            self.lockX_table(table_name)
+            deleted = self.tables[table_name]._delete_where(condition)
+            self.unlock_table(table_name)
+            self._update()
+            self.save()
+            # we need the save above to avoid loading the old database that still contains the deleted elements
+            if table_name[:4]!='meta':
+                self._add_to_insert_stack(table_name, deleted)
+            self.save()
+        else:
+            print("You can\'t delete rows from ", table_name)
 
     def select(self, table_name, columns, condition=None, order_by=None, asc=False,\
                top_k=None, save_as=None, return_object=False):
@@ -308,27 +442,30 @@ class Database:
         return_object -> If true, the result will be a table object (usefull for internal usage). Def: False (the result will be printed)
 
         '''
-        self.load(self.savedir)
-        if self.is_locked(table_name):
-            return
-        self.lockX_table(table_name)
-        if condition is not None:
-            condition_column = split_condition(condition)[0]
-        if self._has_index(table_name) and condition_column==self.tables[table_name].column_names[self.tables[table_name].pk_idx]:
-            index_name = self.select('meta_indexes', '*', f'table_name=={table_name}', return_object=True).index_name[0]
-            bt = self._load_idx(index_name)
-            table = self.tables[table_name]._select_where_with_btree(columns, bt, condition, order_by, asc, top_k)
-        else:
-            table = self.tables[table_name]._select_where(columns, condition, order_by, asc, top_k)
-        self.unlock_table(table_name)
-        if save_as is not None:
-            table._name = save_as
-            self.table_from_object(table)
-        else:
-            if return_object:
-                return table
+        if self.loggedInAs.can_sel_tbl(table_name):
+            self.load(self.savedir)
+            if self.is_locked(table_name):
+                return
+            self.lockX_table(table_name)
+            if condition is not None:
+                condition_column = split_condition(condition)[0]
+            if self._has_index(table_name) and condition_column==self.tables[table_name].column_names[self.tables[table_name].pk_idx]:
+                index_name = self.select('meta_indexes', '*', f'table_name=={table_name}', return_object=True).index_name[0]
+                bt = self._load_idx(index_name)
+                table = self.tables[table_name]._select_where_with_btree(columns, bt, condition, order_by, asc, top_k)
             else:
-                table.show()
+               table = self.tables[table_name]._select_where(columns, condition, order_by, asc, top_k)
+            self.unlock_table(table_name)
+            if save_as is not None:
+                table._name = save_as
+                self.table_from_object(table)
+            else:
+                if return_object:
+                    return table
+                else:
+                    table.show()
+        else:
+            print("You don\'t have the privileges to select contents.")
 
     def show_table(self, table_name, no_of_rows=None):
         '''
